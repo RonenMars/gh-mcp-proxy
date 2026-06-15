@@ -14,25 +14,10 @@ export type JsonRpcResponse = {
     message: string;
     data?: unknown;
   };
+  // Upstream session/continuity headers to echo back to the client (set by the
+  // proxy, not part of the JSON-RPC wire payload — stripped before serializing).
+  _responseHeaders?: Record<string, string>;
 };
-
-// forward() returns either a parsed JSON-RPC response (the common case) or a
-// raw passthrough when upstream replies with a non-JSON body — most importantly
-// a Streamable HTTP SSE stream (`text/event-stream`), which must reach the
-// client untouched rather than being JSON.parse-d into an error.
-export type RawPassthrough = {
-  raw: true;
-  status: number;
-  contentType: string;
-  headers: Headers;
-  body: ReadableStream<Uint8Array> | null;
-};
-
-export type ForwardResult = JsonRpcResponse | RawPassthrough;
-
-export function isRawPassthrough(result: ForwardResult): result is RawPassthrough {
-  return (result as RawPassthrough).raw === true;
-}
 
 const SESSION_HEADERS = [
   "mcp-session-id",
@@ -41,8 +26,8 @@ const SESSION_HEADERS = [
   "x-request-id"
 ];
 
-// Upstream response headers worth surfacing back to the client on a raw
-// passthrough (session continuity for Streamable HTTP).
+// Upstream response headers worth echoing back to the client for session
+// continuity under Streamable HTTP.
 const PASSTHROUGH_RESPONSE_HEADERS = [
   "mcp-session-id",
   "mcp-protocol-version",
@@ -71,7 +56,7 @@ export class UpstreamClient {
   async forward(
     request: JsonRpcRequest,
     incomingHeaders: Headers
-  ): Promise<ForwardResult> {
+  ): Promise<JsonRpcResponse> {
     const headers = new Headers({
       "content-type": "application/json",
       accept: "application/json, text/event-stream"
@@ -104,27 +89,8 @@ export class UpstreamClient {
     }
 
     const contentType = response.headers.get("content-type") ?? "";
-
-    // Streamable HTTP / SSE responses (and any other non-JSON body) are passed
-    // straight through to the client, preserving status and session headers.
-    if (!contentType.includes("application/json")) {
-      const passthroughHeaders = new Headers();
-      for (const name of PASSTHROUGH_RESPONSE_HEADERS) {
-        const value = response.headers.get(name);
-        if (value) {
-          passthroughHeaders.set(name, value);
-        }
-      }
-      return {
-        raw: true,
-        status: response.status,
-        contentType: contentType || "application/octet-stream",
-        headers: passthroughHeaders,
-        body: response.body
-      };
-    }
-
     const text = await response.text();
+
     if (!response.ok) {
       return jsonRpcError(
         request.id,
@@ -133,8 +99,26 @@ export class UpstreamClient {
       );
     }
 
+    // The official github-mcp-server in HTTP mode answers every request as a
+    // single-message SSE frame (`text/event-stream` with one `data:` line
+    // carrying the JSON-RPC payload). Parse the payload out so the proxy can
+    // merge tools / route, rather than passing the stream through opaquely.
+    const payload = contentType.includes("text/event-stream")
+      ? parseSseMessage(text)
+      : text;
+
+    if (payload === undefined) {
+      return jsonRpcError(
+        request.id,
+        -32004,
+        "Upstream SSE response contained no data message",
+        text
+      );
+    }
+
+    let parsed: JsonRpcResponse;
     try {
-      return JSON.parse(text) as JsonRpcResponse;
+      parsed = JSON.parse(payload) as JsonRpcResponse;
     } catch {
       return jsonRpcError(
         request.id,
@@ -143,5 +127,35 @@ export class UpstreamClient {
         text
       );
     }
+
+    const responseHeaders = collectResponseHeaders(response.headers);
+    if (responseHeaders) {
+      parsed._responseHeaders = responseHeaders;
+    }
+    return parsed;
   }
+}
+
+// Extract the JSON payload from a single-message SSE response. Concatenates all
+// `data:` lines of the last event per the SSE spec. Returns undefined if there
+// is no data line.
+function parseSseMessage(text: string): string | undefined {
+  const dataLines: string[] = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    if (rawLine.startsWith("data:")) {
+      dataLines.push(rawLine.slice(5).replace(/^ /, ""));
+    }
+  }
+  return dataLines.length > 0 ? dataLines.join("\n") : undefined;
+}
+
+function collectResponseHeaders(headers: Headers): Record<string, string> | undefined {
+  const collected: Record<string, string> = {};
+  for (const name of PASSTHROUGH_RESPONSE_HEADERS) {
+    const value = headers.get(name);
+    if (value) {
+      collected[name] = value;
+    }
+  }
+  return Object.keys(collected).length > 0 ? collected : undefined;
 }

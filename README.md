@@ -60,8 +60,14 @@ Copy `.env.example` → `.env` and fill in:
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | upstream `github-mcp` | Token for the official server |
 | `GITHUB_TOKEN` | proxy custom tools | Token for the proxy's GitHub REST calls |
 | `PROXY_AUTH_TOKEN` | proxy | Bearer token required from MCP clients |
-| `UPSTREAM_AUTH_TOKEN` | proxy | Optional bearer token injected when forwarding upstream |
+| `UPSTREAM_AUTH_TOKEN` | proxy | Bearer token injected when forwarding upstream — **required**: the official server returns HTTP 401 without it. Set it to the same PAT. |
 | `UPSTREAM_URL` | proxy | Upstream MCP server URL (default `http://github-mcp:8082`) |
+
+> **SSE note:** the official `github-mcp-server` in HTTP mode answers every
+> request as a single-message Server-Sent-Events frame (`text/event-stream` with
+> one `data:` line). The proxy parses that frame back into a JSON-RPC response so
+> it can merge the custom tools and route calls; the upstream `Mcp-Session-Id` is
+> echoed to the client for session continuity.
 
 ## Deployment
 

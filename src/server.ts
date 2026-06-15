@@ -1,17 +1,13 @@
 import http from "node:http";
-import { Readable } from "node:stream";
 import { bulkFileReadTool } from "./tools/bulk_file_read.js";
 import { createIssueWithLabelsAndAssigneesTool } from "./tools/create_issue_with_labels_and_assignees.js";
 import { getCommitDiffTool } from "./tools/get_commit_diff.js";
 import { getWorkflowRunStatusTool } from "./tools/get_workflow_run_status.js";
 import { listPrChecksTool } from "./tools/list_pr_checks.js";
 import {
-  ForwardResult,
-  isRawPassthrough,
   JsonRpcRequest,
   JsonRpcResponse,
   jsonRpcError,
-  RawPassthrough,
   UpstreamClient
 } from "./upstream.js";
 
@@ -81,7 +77,7 @@ export function createServer(options: ServerOptions = {}) {
         res.end();
         return;
       }
-      writeResult(res, result);
+      writeJson(res, result);
     } catch (error) {
       if (isNotification) {
         res.writeHead(202);
@@ -107,9 +103,6 @@ export async function startServer(options: ServerOptions & { port?: number } = {
     id: "startup-tools-list",
     method: "tools/list"
   }, new Headers());
-  if (isRawPassthrough(listResult)) {
-    throw new Error("Upstream returned a non-JSON tools/list during startup; cannot verify tool names");
-  }
   if (listResult.error) {
     throw new Error(`Failed to verify upstream tools during startup: ${listResult.error.message}`);
   }
@@ -126,10 +119,10 @@ export async function handleRequest(
   headers: Headers,
   upstream: UpstreamClient,
   githubToken?: string
-): Promise<ForwardResult> {
+): Promise<JsonRpcResponse> {
   if (request.method === "tools/list") {
     const upstreamResponse = await upstream.forward(request, headers);
-    if (isRawPassthrough(upstreamResponse) || upstreamResponse.error) {
+    if (upstreamResponse.error) {
       return upstreamResponse;
     }
     const upstreamTools = getTools(upstreamResponse.result);
@@ -143,7 +136,8 @@ export async function handleRequest(
           ...upstreamTools,
           ...customTools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }))
         ]
-      }
+      },
+      _responseHeaders: upstreamResponse._responseHeaders
     };
   }
 
@@ -196,30 +190,10 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-function writeResult(res: http.ServerResponse, result: ForwardResult) {
-  if (isRawPassthrough(result)) {
-    writePassthrough(res, result);
-    return;
-  }
-  writeJson(res, result);
-}
-
-function writePassthrough(res: http.ServerResponse, passthrough: RawPassthrough) {
-  const headers: Record<string, string> = { "content-type": passthrough.contentType };
-  passthrough.headers.forEach((value, name) => {
-    headers[name] = value;
-  });
-  res.writeHead(passthrough.status, headers);
-  if (passthrough.body) {
-    Readable.fromWeb(passthrough.body as Parameters<typeof Readable.fromWeb>[0]).pipe(res);
-  } else {
-    res.end();
-  }
-}
-
 function writeJson(res: http.ServerResponse, response: JsonRpcResponse) {
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify(response));
+  const { _responseHeaders, ...body } = response;
+  res.writeHead(200, { "content-type": "application/json", ...(_responseHeaders ?? {}) });
+  res.end(JSON.stringify(body));
 }
 
 function incomingHeaders(req: http.IncomingMessage): Headers {

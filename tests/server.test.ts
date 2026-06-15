@@ -1,22 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { handleRequest } from "../src/server.js";
-import { ForwardResult, isRawPassthrough, JsonRpcRequest, JsonRpcResponse, UpstreamClient } from "../src/upstream.js";
+import { JsonRpcRequest, JsonRpcResponse, UpstreamClient } from "../src/upstream.js";
+import { mockFetch } from "./test_helpers.js";
 
 class MockUpstream extends UpstreamClient {
-  constructor(private readonly response: ForwardResult) {
+  constructor(private readonly response: JsonRpcResponse) {
     super("http://example.invalid");
   }
 
-  override async forward(_request: JsonRpcRequest, _headers: Headers): Promise<ForwardResult> {
+  override async forward(_request: JsonRpcRequest, _headers: Headers): Promise<JsonRpcResponse> {
     return this.response;
   }
-}
-
-function asResponse(result: ForwardResult): JsonRpcResponse {
-  if (isRawPassthrough(result)) {
-    throw new Error("expected a JSON-RPC response, got a raw passthrough");
-  }
-  return result;
 }
 
 describe("server tools/list", () => {
@@ -31,7 +25,7 @@ describe("server tools/list", () => {
       })
     );
 
-    expect(asResponse(result).result).toMatchObject({
+    expect(result.result).toMatchObject({
       tools: expect.arrayContaining([
         expect.objectContaining({ name: "upstream_tool" }),
         expect.objectContaining({ name: "list_pr_checks" })
@@ -50,24 +44,6 @@ describe("server tools/list", () => {
       })
     )).rejects.toThrow("Custom tool name collides with upstream tool: list_pr_checks");
   });
-});
-
-describe("server pass-through", () => {
-  it("forwards a raw SSE passthrough result unchanged", async () => {
-    const result = await handleRequest(
-      { jsonrpc: "2.0", id: 1, method: "initialize" },
-      new Headers(),
-      new MockUpstream({
-        raw: true,
-        status: 200,
-        contentType: "text/event-stream",
-        headers: new Headers(),
-        body: null
-      })
-    );
-
-    expect(isRawPassthrough(result)).toBe(true);
-  });
 
   it("passes the github token to custom tool handlers", async () => {
     // tools/call for a custom tool never touches upstream; this also exercises
@@ -79,6 +55,33 @@ describe("server pass-through", () => {
       "gh-token"
     );
 
-    expect(asResponse(result).result).toMatchObject({ structuredContent: [] });
+    expect(result.result).toMatchObject({ structuredContent: [] });
+  });
+});
+
+describe("upstream SSE parsing", () => {
+  it("parses a single-message SSE response into a JSON-RPC result", async () => {
+    mockFetch([
+      {
+        body: 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"upstream_tool"}]}}\n\n',
+        headers: { "content-type": "text/event-stream", "mcp-session-id": "sess-1" }
+      }
+    ]);
+
+    const upstream = new UpstreamClient("http://upstream.invalid");
+    const response = await upstream.forward({ jsonrpc: "2.0", id: 1, method: "tools/list" }, new Headers());
+
+    expect(response.result).toMatchObject({ tools: [{ name: "upstream_tool" }] });
+    expect(response._responseHeaders).toMatchObject({ "mcp-session-id": "sess-1" });
+  });
+
+  it("surfaces an upstream non-2xx body as a JSON-RPC error", async () => {
+    mockFetch([{ status: 401, body: "Unauthorized", headers: { "content-type": "text/plain" } }]);
+
+    const upstream = new UpstreamClient("http://upstream.invalid");
+    const response = await upstream.forward({ jsonrpc: "2.0", id: 1, method: "tools/list" }, new Headers());
+
+    expect(response.error?.code).toBe(-32003);
+    expect(response.error?.message).toContain("HTTP 401");
   });
 });

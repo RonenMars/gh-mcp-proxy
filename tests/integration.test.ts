@@ -63,11 +63,14 @@ describe("proxy integration", () => {
     expect(upstreamCall.result.content[0].text).toBe("upstream result");
   });
 
-  it("streams SSE upstream responses through unchanged", async () => {
+  it("parses SSE upstream responses into JSON and echoes the session header", async () => {
+    // The official github-mcp-server answers every request as a single-message
+    // SSE frame; the proxy must parse the data line out and return JSON so it can
+    // merge tools and route. Session id is echoed back for continuity.
     const upstream = http.createServer(async (req, res) => {
       await readBody(req);
       res.writeHead(200, { "content-type": "text/event-stream", "mcp-session-id": "sess-1" });
-      res.write("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n");
+      res.write("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\"}}\n\n");
       res.end();
     });
     servers.push(upstream);
@@ -84,9 +87,11 @@ describe("proxy integration", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" })
     });
-    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    expect(response.headers.get("content-type")).toContain("application/json");
     expect(response.headers.get("mcp-session-id")).toBe("sess-1");
-    expect(await response.text()).toContain("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+    const json = await response.json();
+    expect(json).toMatchObject({ id: 1, result: { protocolVersion: "2025-03-26" } });
+    expect(json._responseHeaders).toBeUndefined();
   });
 
   it("acknowledges notifications with 202 and no body", async () => {
