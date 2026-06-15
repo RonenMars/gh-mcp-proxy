@@ -1,0 +1,21 @@
+services:
+  github-mcp:
+    image: ghcr.io/github/github-mcp-server:latest
+    command:
+      - http
+      - --base-url
+      - https://gh-mcp.rbv1000.win
+    environment:
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN}
+
+  gh-mcp-proxy:
+    build: .
+    ports:
+      - "8082:8082"
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      PROXY_AUTH_TOKEN: ${PROXY_AUTH_TOKEN}
+      UPSTREAM_AUTH_TOKEN: ${UPSTREAM_AUTH_TOKEN:-}
+      UPSTREAM_URL: http://github-mcp:8082
+    depends_on:
+      - github-mcp
