@@ -77,3 +77,6 @@ docker compose up -d   # starts upstream (HTTP mode) + proxy on :8082
 ```
 
 Update the upstream image with `docker compose pull && docker compose up -d`.
+
+**Per-OS setup (macOS / Windows / Linux), verification, and troubleshooting:**
+see [`docs/SETUP.md`](docs/SETUP.md).
