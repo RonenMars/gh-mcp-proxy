@@ -91,10 +91,13 @@ the official server already implements the whole MCP auth handshake.
 ### Connecting from claude.ai
 
 Add it as a custom connector pointing at `https://gh-mcp.rbv1000.win`. Discovery and
-the `401` challenge work out of the box, but **GitHub does not support Dynamic
-Client Registration** and serves no authorization-server metadata, so claude.ai
-cannot register itself. Create a GitHub OAuth App and paste its client ID and secret
-into the connector's advanced settings:
+the `401` challenge work out of the box, and GitHub publishes its authorization
+server metadata at the RFC 8414 location
+(`https://github.com/.well-known/oauth-authorization-server/login/oauth`), so the
+authorize and token endpoints are found automatically. That metadata advertises no
+`registration_endpoint` though, so **GitHub does not support Dynamic Client
+Registration** and claude.ai cannot register itself. Create a GitHub OAuth App and
+paste its client ID and secret into the connector's advanced settings:
 
 - **Authorization callback URL:** `https://claude.ai/api/mcp/auth_callback`
 - Scopes come from the proxy's protected-resource metadata (`repo`, `read:org`,
