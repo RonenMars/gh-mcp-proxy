@@ -17,6 +17,10 @@ export type JsonRpcResponse = {
   // Upstream session/continuity headers to echo back to the client (set by the
   // proxy, not part of the JSON-RPC wire payload — stripped before serializing).
   _responseHeaders?: Record<string, string>;
+  // Upstream HTTP status to relay verbatim (set by the proxy, stripped before
+  // serializing). Lets an upstream 401 reach the client as a real 401 carrying
+  // its WWW-Authenticate challenge, which is what starts the OAuth flow.
+  _httpStatus?: number;
 };
 
 const SESSION_HEADERS = [
@@ -31,7 +35,8 @@ const SESSION_HEADERS = [
 const PASSTHROUGH_RESPONSE_HEADERS = [
   "mcp-session-id",
   "mcp-protocol-version",
-  "x-request-id"
+  "x-request-id",
+  "www-authenticate"
 ];
 
 export function jsonRpcError(
@@ -55,7 +60,8 @@ export class UpstreamClient {
 
   async forward(
     request: JsonRpcRequest,
-    incomingHeaders: Headers
+    incomingHeaders: Headers,
+    auth?: string | null
   ): Promise<JsonRpcResponse> {
     const headers = new Headers({
       "content-type": "application/json",
@@ -69,8 +75,15 @@ export class UpstreamClient {
       }
     }
 
-    if (this.authToken) {
-      headers.set("authorization", `Bearer ${this.authToken}`);
+    // `auth` undefined -> act as the proxy itself (static UPSTREAM_AUTH_TOKEN).
+    // `auth` a string   -> act as the caller, forwarding their header verbatim.
+    // `auth` null       -> send none, so upstream issues its 401 challenge.
+    if (auth === undefined) {
+      if (this.authToken) {
+        headers.set("authorization", `Bearer ${this.authToken}`);
+      }
+    } else if (auth !== null) {
+      headers.set("authorization", auth);
     }
 
     let response: Response;
@@ -92,11 +105,19 @@ export class UpstreamClient {
     const text = await response.text();
 
     if (!response.ok) {
-      return jsonRpcError(
+      const failure = jsonRpcError(
         request.id,
         -32003,
         `Upstream MCP server returned HTTP ${response.status}: ${text || response.statusText}`
       );
+      // Relay auth challenges with their real status and WWW-Authenticate header:
+      // that pair is what tells an MCP client to begin the OAuth flow. Collapsing
+      // it into a 200 JSON-RPC error leaves the client nothing to act on.
+      if (response.status === 401 || response.status === 403) {
+        failure._httpStatus = response.status;
+        failure._responseHeaders = collectResponseHeaders(response.headers);
+      }
+      return failure;
     }
 
     // The official github-mcp-server in HTTP mode answers every request as a
@@ -133,6 +154,25 @@ export class UpstreamClient {
       parsed._responseHeaders = responseHeaders;
     }
     return parsed;
+  }
+
+  // Forward a non-JSON-RPC request (OAuth discovery GETs, the optional GET SSE
+  // stream, session-teardown DELETEs) to upstream untouched. The official server
+  // implements the whole MCP auth handshake itself, so the proxy only has to stay
+  // out of its way.
+  async proxyRaw(
+    method: string,
+    path: string,
+    incomingHeaders: Headers
+  ): Promise<Response> {
+    const headers = new Headers();
+    for (const name of [...SESSION_HEADERS, "authorization", "accept"]) {
+      const value = incomingHeaders.get(name);
+      if (value) {
+        headers.set(name, value);
+      }
+    }
+    return fetch(new URL(path, this.url), { method, headers, redirect: "manual" });
   }
 }
 
