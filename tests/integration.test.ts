@@ -4,16 +4,26 @@ import { createServer } from "../src/server.js";
 
 const servers: http.Server[] = [];
 
+const CHALLENGE =
+  'Bearer resource_metadata="https://example.test/.well-known/oauth-protected-resource"';
+
 afterEach(async () => {
   await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
   servers.length = 0;
 });
 
 describe("proxy integration", () => {
-  it("requires auth, merges tools/list, and passes upstream tool calls through", async () => {
+  it("challenges tokenless callers, merges tools/list, and passes upstream tool calls through", async () => {
     const upstream = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const request = JSON.parse(body);
+      // Mirror the real github-mcp-server, which answers a tokenless request with
+      // a 401 carrying the challenge that starts the OAuth flow.
+      if (!req.headers.authorization) {
+        res.writeHead(401, { "content-type": "text/plain", "www-authenticate": CHALLENGE });
+        res.end("Unauthorized");
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       if (request.method === "tools/list") {
         res.end(JSON.stringify({
@@ -35,14 +45,23 @@ describe("proxy integration", () => {
 
     const proxy = createServer({
       upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
-      proxyAuthToken: "proxy-secret"
+      proxyAuthToken: "proxy-secret",
+      upstreamAuthToken: "upstream-pat"
     });
     servers.push(proxy);
     await listen(proxy, 0);
     const proxyPort = (proxy.address() as { port: number }).port;
 
-    const unauthorized = await callProxy(proxyPort, { jsonrpc: "2.0", id: 1, method: "tools/list" });
-    expect(unauthorized.error?.message).toBe("Unauthorized");
+    // The challenge must reach the client as a real 401 with its WWW-Authenticate
+    // header intact — collapsed into a 200 JSON-RPC error, a client has no signal
+    // that it should authenticate.
+    const unauthorized = await fetch(`http://127.0.0.1:${proxyPort}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+    });
+    expect(unauthorized.status).toBe(401);
+    expect(unauthorized.headers.get("www-authenticate")).toBe(CHALLENGE);
 
     const tools = await callProxy(proxyPort, { jsonrpc: "2.0", id: 2, method: "tools/list" }, "proxy-secret");
     expect(tools.result.tools.map((tool: { name: string }) => tool.name)).toEqual(expect.arrayContaining([
@@ -121,8 +140,91 @@ describe("proxy integration", () => {
     expect(forwarded).toBe(true);
   });
 
-  it("rejects unauthorized callers before parsing the body", async () => {
-    const proxy = createServer({ upstreamUrl: "http://127.0.0.1:1", proxyAuthToken: "proxy-secret" });
+  it("relays OAuth discovery GETs to upstream instead of answering 405", async () => {
+    // Answering every non-POST with 405 killed the MCP handshake at its first
+    // step: a client fetches the protected-resource metadata over GET before it
+    // has any token to send.
+    const upstream = http.createServer((req, res) => {
+      if (req.method === "GET" && req.url === "/.well-known/oauth-protected-resource") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          resource: "https://example.test/",
+          authorization_servers: ["https://github.com/login/oauth"]
+        }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    servers.push(upstream);
+    await listen(upstream, 0);
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    const proxy = createServer({
+      upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
+      proxyAuthToken: "proxy-secret"
+    });
+    servers.push(proxy);
+    await listen(proxy, 0);
+    const proxyPort = (proxy.address() as { port: number }).port;
+
+    const response = await fetch(
+      `http://127.0.0.1:${proxyPort}/.well-known/oauth-protected-resource`
+    );
+    expect(response.status).toBe(200);
+    expect((await response.json()).authorization_servers).toEqual([
+      "https://github.com/login/oauth"
+    ]);
+  });
+
+  it("sends the static upstream token for PROXY_AUTH_TOKEN callers and the caller's own token otherwise", async () => {
+    // The whole of the "accept both" model in one assertion: a caller holding the
+    // shared secret acts as the proxy, everyone else acts as themselves.
+    const seen: Array<string | undefined> = [];
+    const upstream = http.createServer(async (req, res) => {
+      await readBody(req);
+      seen.push(req.headers.authorization);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { ok: true } }));
+    });
+    servers.push(upstream);
+    await listen(upstream, 0);
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    const proxy = createServer({
+      upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
+      proxyAuthToken: "proxy-secret",
+      upstreamAuthToken: "upstream-pat"
+    });
+    servers.push(proxy);
+    await listen(proxy, 0);
+    const proxyPort = (proxy.address() as { port: number }).port;
+
+    await callProxy(proxyPort, { jsonrpc: "2.0", id: 1, method: "initialize" }, "proxy-secret");
+    await callProxy(proxyPort, { jsonrpc: "2.0", id: 2, method: "initialize" }, "gho_caller");
+    expect(seen).toEqual(["Bearer upstream-pat", "Bearer gho_caller"]);
+  });
+
+  it("does not serve custom tools to tokenless callers", async () => {
+    // Custom tools are answered inside the proxy, so serving one without a token
+    // would spend the proxy's own GITHUB_TOKEN on an anonymous caller. The call
+    // has to fall through to upstream and come back as a challenge.
+    let reachedUpstream = false;
+    const upstream = http.createServer(async (req, res) => {
+      await readBody(req);
+      reachedUpstream = true;
+      res.writeHead(401, { "content-type": "text/plain", "www-authenticate": CHALLENGE });
+      res.end("Unauthorized");
+    });
+    servers.push(upstream);
+    await listen(upstream, 0);
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    const proxy = createServer({
+      upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
+      proxyAuthToken: "proxy-secret",
+      githubToken: "gho_proxy_secret_token"
+    });
     servers.push(proxy);
     await listen(proxy, 0);
     const proxyPort = (proxy.address() as { port: number }).port;
@@ -130,10 +232,15 @@ describe("proxy integration", () => {
     const response = await fetch(`http://127.0.0.1:${proxyPort}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: "not json"
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "bulk_file_read", arguments: { files: [] } }
+      })
     });
-    const json = await response.json();
-    expect(json.error.message).toBe("Unauthorized");
+    expect(response.status).toBe(401);
+    expect(reachedUpstream).toBe(true);
   });
 });
 

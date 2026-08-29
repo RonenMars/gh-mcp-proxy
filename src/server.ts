@@ -44,18 +44,25 @@ export function createServer(options: ServerOptions = {}) {
   const proxyAuthToken = options.proxyAuthToken ?? process.env.PROXY_AUTH_TOKEN;
 
   return http.createServer(async (req, res) => {
+    // Everything that is not a JSON-RPC POST — OAuth discovery under
+    // `/.well-known/`, the optional GET SSE stream, session-teardown DELETEs —
+    // belongs to upstream, which already implements the full MCP auth handshake.
+    // Answering these with 405 here killed discovery before it began.
     if (req.method !== "POST") {
-      res.writeHead(405, { "content-type": "application/json" });
-      res.end(JSON.stringify(jsonRpcError(null, -32600, "Only POST JSON-RPC requests are supported")));
+      await relayRaw(req, res, upstream);
       return;
     }
 
-    // Authenticate before reading or parsing the body so unauthenticated callers
-    // cannot distinguish "invalid JSON" from "unauthorized".
-    if (proxyAuthToken && req.headers.authorization !== `Bearer ${proxyAuthToken}`) {
-      writeJson(res, jsonRpcError(null, -32001, "Unauthorized"));
-      return;
-    }
+    // Two kinds of caller are accepted. One presenting PROXY_AUTH_TOKEN acts as
+    // the proxy itself: upstream sees UPSTREAM_AUTH_TOKEN and custom tools use the
+    // server-side GITHUB_TOKEN. Any other caller acts as themselves — their
+    // Authorization header is forwarded verbatim and upstream's GitHub OAuth is
+    // the authority on whether it is valid, so the proxy never has to validate a
+    // token it did not issue.
+    const authHeader = req.headers.authorization;
+    const isStaticCaller = Boolean(proxyAuthToken) && authHeader === `Bearer ${proxyAuthToken}`;
+    const upstreamAuth = isStaticCaller ? undefined : (authHeader ?? null);
+    const toolToken = isStaticCaller ? githubToken : bearerToken(authHeader);
 
     const body = await readBody(req);
     let request: JsonRpcRequest;
@@ -71,7 +78,13 @@ export function createServer(options: ServerOptions = {}) {
     const isNotification = request.id === undefined;
 
     try {
-      const result = await handleRequest(request, incomingHeaders(req), upstream, githubToken);
+      const result = await handleRequest(
+        request,
+        incomingHeaders(req),
+        upstream,
+        toolToken,
+        upstreamAuth
+      );
       if (isNotification) {
         res.writeHead(202);
         res.end();
@@ -118,10 +131,11 @@ export async function handleRequest(
   request: JsonRpcRequest,
   headers: Headers,
   upstream: UpstreamClient,
-  githubToken?: string
+  githubToken?: string,
+  upstreamAuth?: string | null
 ): Promise<JsonRpcResponse> {
   if (request.method === "tools/list") {
-    const upstreamResponse = await upstream.forward(request, headers);
+    const upstreamResponse = await upstream.forward(request, headers, upstreamAuth);
     if (upstreamResponse.error) {
       return upstreamResponse;
     }
@@ -144,7 +158,10 @@ export async function handleRequest(
   if (request.method === "tools/call") {
     const params = request.params as { name?: string; arguments?: unknown } | undefined;
     const tool = customTools.find((candidate) => candidate.name === params?.name);
-    if (tool) {
+    // With no token the call is anonymous, so serving it here would spend the
+    // proxy's own GitHub credentials on an unauthenticated caller. Fall through to
+    // upstream instead and let it answer with the 401 challenge.
+    if (tool && githubToken) {
       const result = await tool.handler(params?.arguments ?? {}, githubToken);
       return {
         jsonrpc: "2.0",
@@ -160,7 +177,7 @@ export async function handleRequest(
   // `initialize`, `resources/*`, `prompts/*`, notifications, and every other
   // upstream tool are forwarded unchanged. The proxy only adds tools (merged in
   // tools/list above), so upstream's advertised capabilities pass through as-is.
-  return upstream.forward(request, headers);
+  return upstream.forward(request, headers, upstreamAuth);
 }
 
 function getTools(result: unknown): Array<{ name: string }> {
@@ -191,8 +208,8 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 }
 
 function writeJson(res: http.ServerResponse, response: JsonRpcResponse) {
-  const { _responseHeaders, ...body } = response;
-  res.writeHead(200, { "content-type": "application/json", ...(_responseHeaders ?? {}) });
+  const { _responseHeaders, _httpStatus, ...body } = response;
+  res.writeHead(_httpStatus ?? 200, { "content-type": "application/json", ...(_responseHeaders ?? {}) });
   res.end(JSON.stringify(body));
 }
 
@@ -206,6 +223,72 @@ function incomingHeaders(req: http.IncomingMessage): Headers {
     }
   }
   return headers;
+}
+
+// Response headers worth relaying from a raw (non-JSON-RPC) upstream reply.
+const RAW_RESPONSE_HEADERS = [
+  "content-type",
+  "cache-control",
+  "www-authenticate",
+  "mcp-session-id",
+  "mcp-protocol-version",
+  "location"
+];
+
+async function relayRaw(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  upstream: UpstreamClient
+) {
+  let upstreamResponse: Response;
+  try {
+    upstreamResponse = await upstream.proxyRaw(
+      req.method ?? "GET",
+      req.url ?? "/",
+      incomingHeaders(req)
+    );
+  } catch (error) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify(jsonRpcError(
+      null,
+      -32002,
+      error instanceof Error ? error.message : String(error)
+    )));
+    return;
+  }
+
+  const headers: Record<string, string> = {};
+  for (const name of RAW_RESPONSE_HEADERS) {
+    const value = upstreamResponse.headers.get(name);
+    if (value) {
+      headers[name] = value;
+    }
+  }
+  res.writeHead(upstreamResponse.status, headers);
+
+  if (!upstreamResponse.body) {
+    res.end();
+    return;
+  }
+
+  // Streamed, not buffered: a GET SSE stream stays open indefinitely, so waiting
+  // for EOF would hang the client instead of relaying events as they arrive.
+  const reader = upstreamResponse.body.getReader();
+  res.on("close", () => void reader.cancel().catch(() => {}));
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    if (!res.write(Buffer.from(value))) {
+      await new Promise((resolve) => res.once("drain", resolve));
+    }
+  }
+  res.end();
+}
+
+function bearerToken(header?: string): string | undefined {
+  return header?.match(/^Bearer\s+(.+)$/i)?.[1];
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

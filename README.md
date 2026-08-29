@@ -6,8 +6,7 @@ the GitHub REST API.
 
 The official server is a prebuilt binary and can't be extended directly. This
 proxy sits in front of it at the same public URL, passes the entire upstream MCP
-surface through unchanged, merges in the custom tools, and enforces a bearer-token
-auth boundary before any MCP request is handled.
+surface through unchanged, and merges in the custom tools.
 
 ## Architecture
 
@@ -59,9 +58,50 @@ Copy `.env.example` → `.env` and fill in:
 |----------|---------|---------|
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | upstream `github-mcp` | Token for the official server |
 | `GITHUB_TOKEN` | proxy custom tools | Token for the proxy's GitHub REST calls |
-| `PROXY_AUTH_TOKEN` | proxy | Bearer token required from MCP clients |
+| `PROXY_AUTH_TOKEN` | proxy | Shared secret that lets a client act *as the proxy* (see [Authentication](#authentication)) |
 | `UPSTREAM_AUTH_TOKEN` | proxy | Bearer token injected when forwarding upstream — **required**: the official server returns HTTP 401 without it. Set it to the same PAT. |
 | `UPSTREAM_URL` | proxy | Upstream MCP server URL (default `http://github-mcp:8082`) |
+
+## Authentication
+
+The proxy accepts two kinds of caller and decides per request which identity to use
+upstream.
+
+**A caller presenting `PROXY_AUTH_TOKEN`** acts as the proxy itself: upstream is
+called with `UPSTREAM_AUTH_TOKEN` and the custom tools use the server-side
+`GITHUB_TOKEN`. This is the mode for Claude Code and anything else that can send a
+fixed header:
+
+```bash
+claude mcp add --transport http gh-mcp https://gh-mcp.rbv1000.win \
+  --header "Authorization: Bearer $PROXY_AUTH_TOKEN"
+```
+
+**Any other caller acts as themselves.** Their `Authorization` header is forwarded
+verbatim and the custom tools use *their* token, so the proxy never validates a
+credential it did not issue and never spends its own GitHub token on someone else's
+request. A caller with no token at all is not served locally: the request goes
+upstream and comes back as upstream's `401` with the `WWW-Authenticate` challenge
+that starts the OAuth flow.
+
+Non-POST requests — OAuth discovery under `/.well-known/`, the optional `GET` SSE
+stream, session-teardown `DELETE`s — are forwarded to upstream untouched, because
+the official server already implements the whole MCP auth handshake.
+
+### Connecting from claude.ai
+
+Add it as a custom connector pointing at `https://gh-mcp.rbv1000.win`. Discovery and
+the `401` challenge work out of the box, and GitHub publishes its authorization
+server metadata at the RFC 8414 location
+(`https://github.com/.well-known/oauth-authorization-server/login/oauth`), so the
+authorize and token endpoints are found automatically. That metadata advertises no
+`registration_endpoint` though, so **GitHub does not support Dynamic Client
+Registration** and claude.ai cannot register itself. Create a GitHub OAuth App and
+paste its client ID and secret into the connector's advanced settings:
+
+- **Authorization callback URL:** `https://claude.ai/api/mcp/auth_callback`
+- Scopes come from the proxy's protected-resource metadata (`repo`, `read:org`,
+  `read:user`, …), which upstream derives from its `--base-url`.
 
 > **SSE note:** the official `github-mcp-server` in HTTP mode answers every
 > request as a single-message Server-Sent-Events frame (`text/event-stream` with
